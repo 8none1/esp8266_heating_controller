@@ -32,7 +32,7 @@ const byte PWR_SW = 0;
 bool enabled = false;
 bool ch_on = false;
 bool hw_on = false;
-const unsigned int max_run_time = 5400;
+const unsigned int max_run_time = 5800;
 
 
 // Server
@@ -68,7 +68,21 @@ int16_t temperature_top = 0;
 int16_t temperature_mid = 0;
 int16_t temperature_btm = 0;
 
+// SPIFFS
+File f;
+
 void logger(String message){
+  unsigned int fsize = f.size();
+  if (fsize > 5000) {
+    f.close();
+    SPIFFS.gc();
+    SPIFFS.remove("/log.txt");
+    f = SPIFFS.open("/log.txt", "a+");
+  }
+  f.seek(0,SeekEnd);
+  f.print(timeClient.getFormattedTime());
+  f.print(" : ");
+  f.println(message);
   Serial.println(message);
 }
 
@@ -78,7 +92,14 @@ void store_temperature(String device_name, int16_t temperature) {
   if (device_name == device_tank_btm) temperature_btm = temperature;
 }
 
-
+String getDeviceAddressString(DeviceAddress tempDeviceAddress){
+  String device_address_str;
+  for (uint8_t i = 0; i < 8; i++) {
+        if (tempDeviceAddress[i] < 16) device_address_str += "0";
+        device_address_str += String(tempDeviceAddress[i], HEX);
+      }
+  return device_address_str;
+}
 
 int16_t onewire_reading(){
   // Send all the onewire temperature readings to mqtt
@@ -88,11 +109,12 @@ int16_t onewire_reading(){
   sensors.requestTemperatures();
   for (int i=0; i < temperature_device_count; i++){
     if(sensors.getAddress(tempDeviceAddress, i)) {
-      String device_address_str = "";
-      for (uint8_t i = 0; i < 8; i++) {
-        if (tempDeviceAddress[i] < 16) device_address_str += "0";
-        device_address_str += String(tempDeviceAddress[i], HEX);
-      }
+      String device_address_str = getDeviceAddressString(tempDeviceAddress);
+      //String device_address_str = "";
+      // for (uint8_t i = 0; i < 8; i++) {
+      //   if (tempDeviceAddress[i] < 16) device_address_str += "0";
+      //   device_address_str += String(tempDeviceAddress[i], HEX);
+      // }
       int16_t raw_temp = sensors.getTemp(tempDeviceAddress);
       raw_temp = raw_temp * 100 / 128; // Convert to c
       if (raw_temp > max_temp) max_temp = raw_temp;
@@ -113,6 +135,18 @@ int16_t onewire_reading(){
   return max_temp;
 }
 
+void handleLog() {
+  unsigned int s = f.size();
+  Serial.print("Log bytes: ");
+  Serial.println(s);
+  if (f) {
+    f.seek(0, SeekSet);
+    size_t sent = server.streamFile(f, "text/plain");
+  } else {
+    Serial.println("Failed to send log");
+  }
+}
+
 void handleNotFound() {
   String message = "File Not Found\n\n";
   message += "URI: ";
@@ -122,11 +156,9 @@ void handleNotFound() {
   message += "\nArguments: ";
   message += server.args();
   message += "\n";
-
   for (uint8_t i = 0; i < server.args(); i++) {
     message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
-
   server.send(404, "text/plain", message);
 }
 
@@ -134,8 +166,9 @@ void handleRoot() {
   server.send_P(200, "text/html", html_blob);
 }
 
+
 void controllerStatus(String actor) {
-  // Get current status and return a JSON object
+  // GET current status and return a JSON object
   String message;
   String hwc;
   bool status;
@@ -171,9 +204,11 @@ void controllerStatus(String actor) {
   message += "}";
   server.send(200, "application/json", message);
 }
+
+
 void controllerAction(String actor, String action, String dur = String(max_run_time)){
   unsigned int duration = dur.toInt();
-  // We expect duration in minutes from the old system.  Need to convert
+  // We expect duration in minutes from the old system.  Need to convert to seconds
   if (duration != max_run_time) duration = duration * 60;
   if (duration > max_run_time) duration = max_run_time;
   String offtime = "";
@@ -186,7 +221,6 @@ void controllerAction(String actor, String action, String dur = String(max_run_t
     enabled = true;
     state = "true";
   }
-
   else if ((actor == "psu") && (action == "off")) {
     logger("Disabling PSU and Controller");
     digitalWrite(PWR_RELAY, LOW);
@@ -197,7 +231,6 @@ void controllerAction(String actor, String action, String dur = String(max_run_t
     enabled = false;
     state = "false";
   }
-
   else if ((actor == "hw") && (action == "on") && (enabled == true)) {
     logger("Turn on hot water relay");
     hw_off_epoch = current_epoch + duration;
@@ -205,14 +238,12 @@ void controllerAction(String actor, String action, String dur = String(max_run_t
     offtime = ",\"offtime\":" + String(hw_off_epoch);
     state = "true";
   }
-
   else if ((actor == "hw") && (action == "off")) {
     digitalWrite(HW_RELAY, LOW);
     hw_off_epoch = 0;
     state = "false";
     logger("Switching HW Relay Off");
   }
-
   else if ((actor == "ch") && (action == "on") && (enabled == true)) {
     logger("Turn on heating relay");
     ch_off_epoch = current_epoch + duration;
@@ -220,7 +251,6 @@ void controllerAction(String actor, String action, String dur = String(max_run_t
     offtime = ",\"offtime\":" + String(ch_off_epoch);
     state = "true";
   }
-
   else if ((actor == "ch") && (action == "off")) {
     digitalWrite(CH_RELAY, LOW);
     ch_off_epoch = 0;
@@ -238,6 +268,15 @@ void controllerAction(String actor, String action, String dur = String(max_run_t
 
 void setup() {
   Serial.begin(115200);
+  // Open the log file early
+  if (SPIFFS.begin()) {
+    f = SPIFFS.open("/log.txt", "a+");
+    if (!f) Serial.println("Failed to open log file");
+  } else {
+    Serial.begin(115200);
+    Serial.println("Failed to open SPIFFS");
+    ESP.restart();
+  }
   logger("Booting");
   
   WiFi.mode(WIFI_STA);
@@ -272,7 +311,9 @@ void setup() {
     } else { // U_FS
       type = "filesystem";
     }
-    //SPIFFS.end();
+    f.close();
+    SPIFFS.gc();
+    SPIFFS.end();
     logger("Start updating " + type);
   });
   ArduinoOTA.onEnd([]() {
@@ -334,6 +375,7 @@ void setup() {
     String duration = server.pathArg(2);
     controllerAction(actor, action, duration);
   });
+  server.on("/log", HTTP_GET, handleLog);
   server.onNotFound(handleNotFound);
   server.begin();
   
@@ -416,9 +458,7 @@ void loop() {
       digitalWrite(HW_RELAY, LOW);
       hw_off_epoch = 0;
     }
+    String t = String(timeClient.getFormattedTime());
+    logger(t);
   }
-  
-
- //String t = String(timeClient.getFormattedTime());
-
 } 
