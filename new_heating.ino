@@ -207,7 +207,7 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
     digitalWrite(PWR_RELAY, s);
     digitalWrite(PWR_LED, !s);
     ENABLED = s;
-    if (!s) {
+    if (!ENABLED) {
       ch_off_epoch = 0;
       hw_off_epoch = 0;
       digitalWrite(HW_RELAY, LOW);
@@ -215,7 +215,7 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
       digitalWrite(HW_LED, HIGH);
       digitalWrite(CH_LED, HIGH);
     }
-    logger("Changing PSU state:" + state);
+    logger("Changing PSU state: " + state);
   }
 
   else if ((actor == "hw") && (ENABLED)){
@@ -242,7 +242,6 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
     logger("Changing CH state: " + action);
   }
 
-
   else if (actor == "roomstat") {
     digitalWrite(THERMO_RELAY, s);
     logger("Changed room state: "+ action);
@@ -267,7 +266,6 @@ void setup() {
   // Open the log file early
   if (SPIFFS.begin()) {
     f = SPIFFS.open("/log.txt", "a+");
-    //if (!f) Serial.println("Failed to open log file");
   } else {
     pinMode(CH_SW, FUNCTION_0);
     pinMode(HW_SW, FUNCTION_0);
@@ -325,7 +323,6 @@ void setup() {
   timeClient.begin();
   timeClient.update();
   logger("Connected to NTP server");
-  
 
   // MQTT
   logger("Connecting to the MQTT broker");
