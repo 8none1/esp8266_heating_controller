@@ -12,9 +12,18 @@
 #include "html_blob.h"
 #include "wificreds.h"
 
-#define TEMPERATURE_PRECISION 9
+#define TEMPERATURE_PRECISION 11 // 9 = 0.5C, 10 = 0.125C, 11 = 0.0625C
 
 // Define your wifi creds in wificreds.h
+#ifndef HOSTNAME
+#define HOSTNAME "espheating"
+#endif
+
+// Note for myself:  The "spare" wire was used to stop power back feeding from HW OFF to
+// the old controller.  I can't be arsed hooking it up, so I left it disconnected.  You'll
+// have to use the 4th relay if you want to make some kind of auto bypass.
+
+
 
 
 // Consts
@@ -27,19 +36,26 @@ const byte  THERMO_RELAY = 13;
 const byte  PWR_LED      = 15;
 const byte  CH_LED       = 2;
 const byte  HW_LED       = 4;
-const byte  PWR_SW       = 0;
-const byte  CH_SW      = 1; // TX_GPIO
-const byte  HW_SW      = 3; // RX_GPIO
+const byte  ONEWIRE_PIN  = 5;
+const byte  CH_SW        = 0;//1; // TX_GPIO
+const byte  HW_SW        = 3; // RX_GPIO
 const unsigned int MAX_RUN_TIME = 5400;
 
 // Globals
-bool ENABLED = false;
-int  MAX_HW_TEMP = 5600;
+bool ENABLED = true;
+float MAX_HW_TEMP = 56.0;
 
 // Server
 ESP8266WebServer server(80);
 
 // Time stuff
+/// TODO:  I was going to use wall time for scheduling, but in the end
+/// I decided to move all of that logic out to something else.  I could
+/// either build in some scheduling system so that if the outside controller
+/// is down we can still turn on and off at certain times, or...
+/// more likely....
+/// just remove all of this NTP stuff and fall back to millis where I'm using epoch.
+/// Other systems in my house which use this do deal with epoch though, so meh.
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "time"); //, utcOffsetInSeconds);
 unsigned long current_epoch;
@@ -54,17 +70,17 @@ WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
 const char broker[] = "smarthome";
 const int  port     = 1883;
-const char topic[]  = "arduino/simple";
+
 
 // One Wire Stuff
-OneWire ds(5);
+OneWire ds(ONEWIRE_PIN);
 DallasTemperature sensors(&ds);
 byte temperature_device_count = 0;
 
 // Device mappings
-String device_tank_top = "28ebed3c05000096";
-String device_tank_mid = "";
-String device_tank_btm = "";
+String device_tank_top = "283b127504000043";
+String device_tank_mid = "2824ed58050000b3";
+String device_tank_btm = "28e4460e070000f1";
 int16_t temperature_top = 0;
 int16_t temperature_mid = 0;
 int16_t temperature_btm = 0;
@@ -111,22 +127,28 @@ int16_t onewire_reading(){
   for (int i=0; i < temperature_device_count; i++){
     if(sensors.getAddress(tempDeviceAddress, i)) {
       String device_address_str = getDeviceAddressString(tempDeviceAddress);
-      int16_t raw_temp = sensors.getTemp(tempDeviceAddress);
-      raw_temp = raw_temp * 100 / 128; // Convert to c
-      if (raw_temp > max_temp) max_temp = raw_temp;
-      if (raw_temp == DEVICE_DISCONNECTED_RAW) {
+      float degreesC = sensors.getTempC(tempDeviceAddress);
+      if (degreesC > max_temp) max_temp = degreesC;
+      if (degreesC == DEVICE_DISCONNECTED_C) {
         String message = "Failed to read one wire sensor: " + device_address_str;
         logger(message);
-        return DEVICE_DISCONNECTED_RAW;
+        return DEVICE_DISCONNECTED_C;
       }
-      String json_string = "{\"" + device_address_str + "\":"+String(raw_temp)+"}";
+      //float water_temp_c = raw_temp / 1000.0;
+      String json_string = "{\"temperature\":"+String(degreesC)+"}";
       logger(json_string);
+
       // Send MQTT message
+      String device_name;
+      if (device_address_str == device_tank_top) device_name = "top";
+      if (device_address_str == device_tank_mid) device_name = "mid";
+      if (device_address_str == device_tank_btm) device_name = "btm";
+      String topic = "sensors/hwc/"+device_name;
       mqttClient.beginMessage(topic);
       mqttClient.print(json_string);
       mqttClient.endMessage();
       // Save temperature for web site
-      store_temperature(device_address_str, raw_temp);
+      store_temperature(device_address_str, degreesC);
     }
   }
   return max_temp;
@@ -147,7 +169,7 @@ void handleSetMaxTemp(String new_max_temp){
   String message = String(new_max_temp);
   message = "Setting new MAX_HW_TEMP: " + message;
   logger(message);
-  MAX_HW_TEMP = new_max_temp.toInt();
+  MAX_HW_TEMP = new_max_temp.toFloat();
 }
 
 void controllerStatus(String actor) {
@@ -225,9 +247,7 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
       hw_off_epoch = off_epoch;
       offtime = ",\"offtime\":" + String(hw_off_epoch);
     }
-    else {
-      hw_off_epoch = 0;
-    }
+    else hw_off_epoch = 0;
     logger("Changing HW state: " + action);
   }
 
@@ -248,8 +268,8 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
   }
 
   else {
-    if (!ENABLED) server.send(404, "application/json", "{\"state\":false,\"message\":\"Controller not enabled\",\"result\":true}");
-    else server.send(404, "application/json", "{\"status\":false,\"message\":\"Failed to parse POSTed options\",\"result\":false}");
+    if (!ENABLED) server.send(404, "application/json", F("{\"state\":false,\"message\":\"Controller not enabled\",\"result\":true}"));
+    else server.send(404, "application/json", F("{\"status\":false,\"message\":\"Failed to parse POSTed options\",\"result\":false}"));
     return;
   }
   message = "{\"result\":true, \"state\":" + state + offtime + "}";
@@ -257,7 +277,7 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
 }
 
 void handleNotFound() {
-  String message = "File Not Found\n";
+  String message = F("File Not Found\n");
   server.send(404, "text/plain", message);
 }
 
@@ -277,7 +297,7 @@ void setup() {
   logger("\n\n\n\n----------\nBooting");
   
   WiFi.mode(WIFI_STA);
-  WiFi.hostname("new_heat");
+  WiFi.hostname(HOSTNAME);
   WiFi.begin(SSID, WIFIPASS);
   while (WiFi.waitForConnectResult() != WL_CONNECTED) {
     logger("Couldn't connect to Wifi! Rebooting...");
@@ -290,14 +310,13 @@ void setup() {
   pinMode(CH_RELAY, OUTPUT);
   pinMode(HW_RELAY, OUTPUT);
   pinMode(THERMO_RELAY, OUTPUT);
-  digitalWrite(PWR_RELAY, LOW);
+  digitalWrite(PWR_RELAY, HIGH); // enable at power on
   digitalWrite(CH_RELAY, LOW);
   digitalWrite(HW_RELAY, LOW);
   digitalWrite(THERMO_RELAY, LOW);
   pinMode(PWR_LED, OUTPUT);
   pinMode(CH_LED, OUTPUT);
   pinMode(HW_LED, OUTPUT);
-  pinMode(PWR_SW, INPUT_PULLUP);
   pinMode(CH_SW, FUNCTION_3);
   pinMode(HW_SW, FUNCTION_3);
   pinMode(CH_SW, INPUT_PULLUP);
@@ -305,7 +324,7 @@ void setup() {
 
   
   // Set up OTA updates
-  ArduinoOTA.setHostname("new_heat_ota");
+  ArduinoOTA.setHostname(HOSTNAME);
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -322,17 +341,18 @@ void setup() {
   // NTP
   timeClient.begin();
   timeClient.update();
-  logger("Connected to NTP server");
+  logger(F("Connected to NTP server"));
 
   // MQTT
-  logger("Connecting to the MQTT broker");
+  logger(F("Connecting to the MQTT broker"));
   if (!mqttClient.connect(broker, port)) logger("MQTT connection failed!");
 
   // OneWire
   sensors.begin();
   temperature_device_count = sensors.getDeviceCount();
-  String message = "Found 1wire temperature devices: ";
+  String message = F("Found 1wire temperature devices: ");
   message += String(temperature_device_count);
+  message += F("\n");
   logger(message);
   DeviceAddress tempDeviceAddress;
   for(int i=0;i<temperature_device_count; i++)  {
@@ -340,12 +360,13 @@ void setup() {
       sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
     }
   }
+  onewire_reading();
     
   // Set up HTTP server responders
   server.on("/", HTTP_GET, handleRoot);
   server.on("/log", HTTP_GET, handleLog);
   server.on("/get/max_hw_temp", HTTP_GET, []() {
-    String message = "{\"max_hw_temp\":";
+    String message = F("{\"max_hw_temp\":");
     message += String(MAX_HW_TEMP);
     message += "}";
     logger(message);
@@ -371,14 +392,15 @@ void setup() {
     handleSetMaxTemp(new_max_temp);
   });
   server.onNotFound(handleNotFound);
-  logger("Starting web server");
+  logger(F("Starting web server"));
   server.begin();
   
-  if (MDNS.begin("new-heat")) {
-    logger("MDNS responder started");
+  if (MDNS.begin(HOSTNAME)) {
+    logger(F("MDNS responder started"));
   }
-
-  logger("Setup complete. Ready.");  
+  logger(F("Hostname..."));
+  logger(HOSTNAME);
+  logger(F("Setup complete. Ready.\n\n"));
 }
 
 void loop() {
@@ -395,13 +417,13 @@ void loop() {
 
 
   if ((current_epoch > ch_off_epoch) && (ch_off_epoch > 0)){
-      logger("CH time up.  Turning off");
+      logger(F("CH time up.  Turning off"));
       digitalWrite(CH_RELAY, LOW);
       ch_off_epoch = 0;
     }
 
   if ((current_epoch > hw_off_epoch) && (hw_off_epoch > 0)) {
-      logger("HW time up.  Turning off");
+      logger(F("HW time up.  Turning off"));
       digitalWrite(HW_RELAY, LOW);
       hw_off_epoch = 0;
   }
@@ -413,30 +435,15 @@ void loop() {
   
 
   // Switch stuff
-  ///  PWR Switch
-  if (digitalRead(PWR_SW) == LOW) {
-    logger("PWR Button pressed");
-    unsigned long st = millis();
-    while (!digitalRead(PWR_SW) && (millis()-st < 2000)) {
-      delay(10);
-    };
-    logger("PWR Button released");
-    if (millis() - st > 2000) {
-      String s = (!ENABLED) ? "on" : "off";
-      controllerAction("psu", s);
-      }
-      delay(1000);  // Give the user time to let go of the button when they here the click
-  };
-
   /// HW Switch
   if (digitalRead(HW_SW) == LOW) {
-    logger("HW Button pressed");
+    logger(F("HW Button pressed"));
     unsigned int st = millis();
-    while (!digitalRead(HW_SW) && (millis()-st < 1000)) {
+    while (!digitalRead(HW_SW) && (millis()-st < 5000)) {
       delay(10);
     };
-    logger("HW button released or timer exceeded");
-    if ((millis() - st >= 1000) && (ENABLED)) {
+    logger(F("HW button released or timer exceeded"));
+    if ((millis() - st >= 500) && (ENABLED)) {
       String s = (!digitalRead(HW_RELAY)) ? "on" : "off";
       controllerAction("hw", s);
       delay(1000);
@@ -444,14 +451,20 @@ void loop() {
   };
 
   /// CH Switch
+  /// CH switch is on GPIO0, so hold it at power on to enable serial flashing
   if (digitalRead(CH_SW) == LOW) {
-    logger("CH Button pressed");
+    logger(F("CH Button pressed"));
     unsigned int st = millis();
-    while (!digitalRead(CH_SW) && (millis()-st < 1000)) {
+    while (!digitalRead(CH_SW) && (millis()-st < 2000)) {
       delay(10);
     };
-    logger("CH button released or timer exceeded");
-    if ((millis() - st > 1000) && (ENABLED)) {
+    logger(F("CH button released or timer exceeded"));
+    if (millis() - st > 2000) {
+      String s = (!ENABLED) ? "on" : "off";
+      controllerAction("psu", s);
+      delay(1000);
+    };
+    if ((millis() - st < 1500) && (ENABLED)) {
       String s = (!digitalRead(CH_RELAY)) ? "on" : "off";
       controllerAction("ch", s);
       delay(1000);
@@ -472,9 +485,9 @@ void loop() {
   if (millis() - millis_10m > 600000) {
     timeClient.update();
     millis_10m = millis();
-    int16_t max_temp = onewire_reading();
+    float max_temp = onewire_reading();
     if (max_temp > MAX_HW_TEMP) {
-      logger("HW is up to temperature.  Turning off.");
+      logger(F("HW is up to temperature.  Turning off."));
       digitalWrite(HW_RELAY, LOW);
       hw_off_epoch = 0;
     }
