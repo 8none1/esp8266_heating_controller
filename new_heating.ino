@@ -486,7 +486,7 @@ void loop() {
     timeClient.update();
     millis_10m = millis();
     float max_temp = onewire_reading();
-    if (max_temp > MAX_HW_TEMP) {
+    if ((max_temp > MAX_HW_TEMP) && (digitalRead(HW_RELAY))) {
       logger(F("HW is up to temperature.  Turning off."));
       digitalWrite(HW_RELAY, LOW);
       hw_off_epoch = 0;
