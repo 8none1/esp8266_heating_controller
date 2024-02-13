@@ -8,23 +8,20 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ArduinoMqttClient.h>
-#include <FS.h>
+#include "LittleFS.h"
 #include "html_blob.h"
 #include "wificreds.h"
 
-#define TEMPERATURE_PRECISION 11 // 9 = 0.5C, 10 = 0.125C, 11 = 0.0625C
+#define TEMPERATURE_PRECISION 10 // 9 = 0.5C, 10 = 0.125C, 11 = 0.0625C.  Reading is slower higher precision.
 
 // Define your wifi creds in wificreds.h
 #ifndef HOSTNAME
-#define HOSTNAME "espheating"
+#define HOSTNAME "piwarmer"
 #endif
 
 // Note for myself:  The "spare" wire was used to stop power back feeding from HW OFF to
 // the old controller.  I can't be arsed hooking it up, so I left it disconnected.  You'll
 // have to use the 4th relay if you want to make some kind of auto bypass.
-
-
-
 
 // Consts
 const char* SSID         = STASSID;
@@ -37,13 +34,13 @@ const byte  PWR_LED      = 15;
 const byte  CH_LED       = 2;
 const byte  HW_LED       = 4;
 const byte  ONEWIRE_PIN  = 5;
-const byte  CH_SW        = 0;//1; // TX_GPIO
+const byte  CH_SW        = 0; //1; // TX_GPIO
 const byte  HW_SW        = 3; // RX_GPIO
 const unsigned int MAX_RUN_TIME = 5400;
 
 // Globals
 bool ENABLED = true;
-float MAX_HW_TEMP = 56.0;
+float MAX_HW_TEMP = 55.0;
 
 // Server
 ESP8266WebServer server(80);
@@ -61,9 +58,11 @@ NTPClient timeClient(ntpUDP, "time"); //, utcOffsetInSeconds);
 unsigned long current_epoch;
 unsigned long hw_off_epoch = 0;
 unsigned long ch_off_epoch = 0;
+unsigned long deenergise_epoch = 0;
 unsigned long millis_1s = 0;
+unsigned long millis_5m = 0;
 unsigned long millis_10m = 0;
-
+bool deenergise_motor = false;
 
 // MQTT Stuff
 WiFiClient wifiClient;
@@ -78,30 +77,43 @@ DallasTemperature sensors(&ds);
 byte temperature_device_count = 0;
 
 // Device mappings
-String device_tank_top = "283b127504000043";
-String device_tank_mid = "2824ed58050000b3";
-String device_tank_btm = "28e4460e070000f1";
+String device_tank_top = "287c220e070000ef";
+String device_tank_mid = "28f72d0e07000092";
+String device_tank_btm = "28f33e0e0700007c";
 int16_t temperature_top = 0;
 int16_t temperature_mid = 0;
 int16_t temperature_btm = 0;
 
-// SPIFFS
+// LittleFS stuff
 File f;
 
 void logger(String message){
   unsigned int fsize = f.size();
-  if (fsize > 100000) {
+  if (fsize > 5000) {
     f.close();
-    SPIFFS.gc();
-    SPIFFS.remove("/log.txt");
-    f = SPIFFS.open("/log.txt", "a+");
+    LittleFS.remove("/log.txt");
+    f = LittleFS.open("/log.txt", "a+");
     f.println("Log cleared");
   }
-  f.seek(0,SeekEnd);
+
   f.print(timeClient.getFormattedTime());
   f.print(" : ");
-  f.println(message);
+  f.print(message);
+  f.println();
 }
+
+void sendMqtt(String topic, String message){
+  if (!mqttClient.connected()) {
+    int c = mqttClient.connect(broker, port);
+    if (!c) {
+      logger("MQTT connect failed trying to send message");
+      return;
+    }
+  }
+  mqttClient.beginMessage(topic);
+  mqttClient.print(message);
+  mqttClient.endMessage();
+};
 
 void store_temperature(String device_name, int16_t temperature) {
   if (device_name == device_tank_top) temperature_top = temperature;
@@ -136,7 +148,7 @@ int16_t onewire_reading(){
       }
       //float water_temp_c = raw_temp / 1000.0;
       String json_string = "{\"temperature\":"+String(degreesC)+"}";
-      logger(json_string);
+      //logger(json_string);
 
       // Send MQTT message
       String device_name;
@@ -144,9 +156,7 @@ int16_t onewire_reading(){
       if (device_address_str == device_tank_mid) device_name = "mid";
       if (device_address_str == device_tank_btm) device_name = "btm";
       String topic = "sensors/hwc/"+device_name;
-      mqttClient.beginMessage(topic);
-      mqttClient.print(json_string);
-      mqttClient.endMessage();
+      sendMqtt(topic, json_string);
       // Save temperature for web site
       store_temperature(device_address_str, degreesC);
     }
@@ -222,10 +232,14 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
 
   String offtime;
   String message;
+  String topic;
+  String json_string;
+
   bool s = (action == "on") ? 1 : 0;
   String state = (s) ? "true" : "false";
 
   if (actor=="psu"){
+    topic = "sensors/chpsu/state";
     digitalWrite(PWR_RELAY, s);
     digitalWrite(PWR_LED, !s);
     ENABLED = s;
@@ -241,6 +255,8 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
   }
 
   else if ((actor == "hw") && (ENABLED)){
+    topic = "sensors/hw/state";
+    //logger("In HW section");
     digitalWrite(HW_RELAY, s);
     digitalWrite(HW_LED, !s);
     if (s) {
@@ -252,17 +268,27 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
   }
 
   else if ((actor == "ch") && (ENABLED)) {
+    topic = "sensors/ch/state";
+    //logger("In CH section");
     digitalWrite(CH_RELAY, s);
     digitalWrite(CH_LED, !s);
     if (s) {
       ch_off_epoch = off_epoch;
       offtime = ",\"offtime\":" + String(ch_off_epoch);
     }
-    else ch_off_epoch = 0;
+    else {
+      ch_off_epoch = 0;
+      if (digitalRead(HW_RELAY) == LOW){
+        // CH has turned off, and HW is off so we need to de-energise
+        logger("De-energising via CH off through API");
+        deenergise_epoch = current_epoch + 30;
+      }
+    }
     logger("Changing CH state: " + action);
   }
 
   else if (actor == "roomstat") {
+    topic = "sensors/chroomstat/state";
     digitalWrite(THERMO_RELAY, s);
     logger("Changed room state: "+ action);
   }
@@ -272,8 +298,12 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
     else server.send(404, "application/json", F("{\"status\":false,\"message\":\"Failed to parse POSTed options\",\"result\":false}"));
     return;
   }
+  //logger("Preparing to send reply to HTTP");
   message = "{\"result\":true, \"state\":" + state + offtime + "}";
   server.send(200, "application/json", message);
+  //logger("Sent HTTP 200 back");
+  json_string = "{\"state\":" + state + "}";
+  sendMqtt(topic, json_string);
 }
 
 void handleNotFound() {
@@ -282,22 +312,24 @@ void handleNotFound() {
 }
 
 void setup() {
-  //Serial.begin(115200);
+  //Serial.begin(115200); // XX
   // Open the log file early
-  if (SPIFFS.begin()) {
-    f = SPIFFS.open("/log.txt", "a+");
+  if (LittleFS.begin()) {
+    f = LittleFS.open("/log.txt", "a+");
   } else {
-    pinMode(CH_SW, FUNCTION_0);
-    pinMode(HW_SW, FUNCTION_0);
-    Serial.begin(115200);
+    pinMode(CH_SW, FUNCTION_0); // XX
+    pinMode(HW_SW, FUNCTION_0);  // XX
+    Serial.begin(115200);//xx
     Serial.println("Failed to open SPIFFS for log file.  Can't continue.");
-    delay(5000);
-    ESP.restart();
+    delay(5000); //xx
+    //ESP.restart(); //xx
   }
   logger("\n\n\n\n----------\nBooting");
   
   WiFi.mode(WIFI_STA);
   WiFi.hostname(HOSTNAME);
+  WiFi.setAutoConnect(true);
+  WiFi.setSleep(WIFI_PS_NONE);
   WiFi.begin(SSID, WIFIPASS);
   while (WiFi.waitForConnectResult() != WL_CONNECTED) {
     logger("Couldn't connect to Wifi! Rebooting...");
@@ -317,10 +349,10 @@ void setup() {
   pinMode(PWR_LED, OUTPUT);
   pinMode(CH_LED, OUTPUT);
   pinMode(HW_LED, OUTPUT);
-  pinMode(CH_SW, FUNCTION_3);
-  pinMode(HW_SW, FUNCTION_3);
-  pinMode(CH_SW, INPUT_PULLUP);
-  pinMode(HW_SW, INPUT_PULLUP);
+  pinMode(CH_SW, FUNCTION_3);//xx
+  pinMode(HW_SW, FUNCTION_3);//xx
+  pinMode(CH_SW, INPUT_PULLUP);//xx
+  pinMode(HW_SW, INPUT_PULLUP);//xx
 
   
   // Set up OTA updates
@@ -333,8 +365,8 @@ void setup() {
       type = "filesystem";
     }
     f.close();
-    SPIFFS.gc();
-    SPIFFS.end();
+    // SPIFFS.gc();
+    LittleFS.end();
   });
   ArduinoOTA.begin();
 
@@ -352,11 +384,14 @@ void setup() {
   temperature_device_count = sensors.getDeviceCount();
   String message = F("Found 1wire temperature devices: ");
   message += String(temperature_device_count);
-  message += F("\n");
   logger(message);
   DeviceAddress tempDeviceAddress;
   for(int i=0;i<temperature_device_count; i++)  {
     if(sensors.getAddress(tempDeviceAddress, i)) {
+      String message = F("Found 1wire temperature device: ");
+      String device_address_str = getDeviceAddressString(tempDeviceAddress);
+      message += device_address_str;
+      logger(message);
       sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
     }
   }
@@ -369,7 +404,7 @@ void setup() {
     String message = F("{\"max_hw_temp\":");
     message += String(MAX_HW_TEMP);
     message += "}";
-    logger(message);
+    //logger(message);
     server.send(200, "application/json", message);
   });
   server.on(UriBraces("/get/{}"), HTTP_GET, []() {
@@ -391,6 +426,11 @@ void setup() {
     String new_max_temp = server.pathArg(0);
     handleSetMaxTemp(new_max_temp);
   });
+
+  server.on("/reboot", HTTP_POST, []() {
+    server.send(200, "application/json", F("{\"result\":true,\"message\":\"Rebooting...\"}"));
+    ESP.restart();
+  });
   server.onNotFound(handleNotFound);
   logger(F("Starting web server"));
   server.begin();
@@ -400,7 +440,7 @@ void setup() {
   }
   logger(F("Hostname..."));
   logger(HOSTNAME);
-  logger(F("Setup complete. Ready.\n\n"));
+  logger(F("Setup complete. Ready."));
 }
 
 void loop() {
@@ -418,58 +458,70 @@ void loop() {
 
   if ((current_epoch > ch_off_epoch) && (ch_off_epoch > 0)){
       logger(F("CH time up.  Turning off"));
-      digitalWrite(CH_RELAY, LOW);
+      //digitalWrite(CH_RELAY, LOW);
+      controllerAction("ch", "off", "1");
       ch_off_epoch = 0;
+      if (digitalRead(HW_RELAY) == LOW) {
+        logger(F("Setting de-energise epoch"));
+        deenergise_epoch = current_epoch + 30;
+      }
     }
 
   if ((current_epoch > hw_off_epoch) && (hw_off_epoch > 0)) {
       logger(F("HW time up.  Turning off"));
-      digitalWrite(HW_RELAY, LOW);
+      // digitalWrite(HW_RELAY, LOW);
+      controllerAction("hw", "off", "1");
       hw_off_epoch = 0;
   }
 
+  if ((current_epoch > deenergise_epoch) && (deenergise_epoch > 0)) {
+      logger(F("De-energising motor"));
+      controllerAction("hw", "on", "1");
+      deenergise_epoch = 0;
+      //deenergise_motor = false;
+  }
   // Status LEDs are set by looking at the relays.
   // Logic is inverted because LEDs are pull down on
   digitalWrite(CH_LED, !digitalRead(CH_RELAY));
   digitalWrite(HW_LED, !digitalRead(HW_RELAY));
   
 
-  // Switch stuff
-  /// HW Switch
-  if (digitalRead(HW_SW) == LOW) {
-    logger(F("HW Button pressed"));
-    unsigned int st = millis();
-    while (!digitalRead(HW_SW) && (millis()-st < 5000)) {
-      delay(10);
-    };
-    logger(F("HW button released or timer exceeded"));
-    if ((millis() - st >= 500) && (ENABLED)) {
-      String s = (!digitalRead(HW_RELAY)) ? "on" : "off";
-      controllerAction("hw", s);
-      delay(1000);
-    }
-  };
+  // Switch stuff // xxV
+  // /// HW Switch
+  // if (digitalRead(HW_SW) == LOW) {
+  //   logger(F("HW Button pressed"));
+  //   unsigned int st = millis();
+  //   while (!digitalRead(HW_SW) && (millis()-st < 5000)) {
+  //     delay(10);
+  //   };
+  //   logger(F("HW button released or timer exceeded"));
+  //   if ((millis() - st >= 500) && (ENABLED)) {
+  //     String s = (!digitalRead(HW_RELAY)) ? "on" : "off";
+  //     controllerAction("hw", s);
+  //     delay(1000);
+  //   }
+  // };
 
-  /// CH Switch
-  /// CH switch is on GPIO0, so hold it at power on to enable serial flashing
-  if (digitalRead(CH_SW) == LOW) {
-    logger(F("CH Button pressed"));
-    unsigned int st = millis();
-    while (!digitalRead(CH_SW) && (millis()-st < 2000)) {
-      delay(10);
-    };
-    logger(F("CH button released or timer exceeded"));
-    if (millis() - st > 2000) {
-      String s = (!ENABLED) ? "on" : "off";
-      controllerAction("psu", s);
-      delay(1000);
-    };
-    if ((millis() - st < 1500) && (ENABLED)) {
-      String s = (!digitalRead(CH_RELAY)) ? "on" : "off";
-      controllerAction("ch", s);
-      delay(1000);
-    }
-  };
+  // /// CH Switch
+  // /// CH switch is on GPIO0, so hold it at power on to enable serial flashing
+  // if (digitalRead(CH_SW) == LOW) {
+  //   logger(F("CH Button pressed"));
+  //   unsigned int st = millis();
+  //   while (!digitalRead(CH_SW) && (millis()-st < 2000)) {
+  //     delay(10);
+  //   };
+  //   logger(F("CH button released or timer exceeded"));
+  //   if (millis() - st > 2000) {
+  //     String s = (!ENABLED) ? "on" : "off";
+  //     controllerAction("psu", s);
+  //     delay(1000);
+  //   };
+  //   if ((millis() - st < 1500) && (ENABLED)) {
+  //     String s = (!digitalRead(CH_RELAY)) ? "on" : "off";
+  //     controllerAction("ch", s);
+  //     delay(1000);
+  //   }
+  // }; // xx ^
 
   // 1 second pulse
   if (millis() - millis_1s > 1000) {
@@ -481,15 +533,22 @@ void loop() {
     }
   }
 
-  // 10 minute pulse
-  if (millis() - millis_10m > 600000) {
-    timeClient.update();
-    millis_10m = millis();
+  // 5 minute pulse
+  // Hack this to be every one minute
+  //if (millis() - millis_5m > 300000) {
+  if (millis() - millis_5m >   60000) {
+    millis_5m = millis();
     float max_temp = onewire_reading();
     if ((max_temp > MAX_HW_TEMP) && (digitalRead(HW_RELAY))) {
       logger(F("HW is up to temperature.  Turning off."));
       digitalWrite(HW_RELAY, LOW);
       hw_off_epoch = 0;
     }
+  }
+
+  // 10 minute pulse
+  if (millis() - millis_10m > 600000) {
+    timeClient.update();
+    millis_10m = millis();
   }
 } 

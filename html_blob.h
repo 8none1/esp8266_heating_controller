@@ -353,10 +353,10 @@ logger(bottomcolour);
 function colourFromTemp(temp) {
     var t = temp;
     if (t < 20) t = 20;
-    if (t > 55) t = 55;
-    t = t - 20; // so it's now a value between 0 and 35
-    redness = Math.round(t * 255 / 35);
-    blueness = Math.round(255 - (t * 255 / 35));
+    if (t > 50) t = 50;
+    t = t - 20; // so it's now a value between 0 and 30
+    redness = Math.round(t * 255 / 30);
+    blueness = Math.round(255 - (t * 255 / 30));
     //return "rgba(" + redness + ",0," + blueness + ",0)";
     return "rgb(" + redness + ",0," + blueness+")";
 };
