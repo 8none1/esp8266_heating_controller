@@ -461,6 +461,7 @@ void setup() {
   logger(F("Hostname..."));
   logger(HOSTNAME);
   logger(F("Setup complete. Ready."));
+  updateMqttState();
 }
 
 void loop() {
