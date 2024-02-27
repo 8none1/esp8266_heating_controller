@@ -306,6 +306,26 @@ void controllerAction(String actor, String action, String dur = String(MAX_RUN_T
   sendMqtt(topic, json_string);
 }
 
+void updateMqttState() {
+  // Update the MQTT state with the current state of the relays
+  String message;
+  String topic;
+  String json_string;
+  bool state;
+
+  state = digitalRead(HW_RELAY);
+  message = (state) ? "true" : "false";
+  topic = "sensors/hw/state";
+  json_string = "{\"state\":" + message + "}";
+  sendMqtt(topic, json_string);
+
+  state = digitalRead(CH_RELAY);
+  message = (state) ? "true" : "false";
+  topic = "sensors/ch/state";
+  json_string = "{\"state\":" + message + "}";
+  sendMqtt(topic, json_string);
+}
+
 void handleNotFound() {
   String message = F("File Not Found\n");
   server.send(404, "text/plain", message);
@@ -537,13 +557,14 @@ void loop() {
   // Hack this to be every one minute
   //if (millis() - millis_5m > 300000) {
   if (millis() - millis_5m >   60000) {
-    millis_5m = millis();
+    updateMqttState();
     float max_temp = onewire_reading();
     if ((max_temp > MAX_HW_TEMP) && (digitalRead(HW_RELAY))) {
       logger(F("HW is up to temperature.  Turning off."));
       digitalWrite(HW_RELAY, LOW);
       hw_off_epoch = 0;
-    }
+    };
+    millis_5m = millis();
   }
 
   // 10 minute pulse
