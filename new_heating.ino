@@ -67,7 +67,7 @@ bool deenergise_motor = false;
 // MQTT Stuff
 WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
-const char broker[] = "smarthome";
+const char broker[] = "mqtt";
 const int  port     = 1883;
 
 
