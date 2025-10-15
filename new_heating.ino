@@ -87,6 +87,53 @@ int16_t temperature_btm = 0;
 // LittleFS stuff
 File f;
 
+String getFormattedDate(unsigned long epochTime) {
+  // Calculate date from epoch time
+  unsigned long days = epochTime / 86400;
+  unsigned long year = 1970;
+  unsigned long dayOfYear;
+  
+  // Calculate year
+  while (true) {
+    unsigned long daysInYear = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 366 : 365;
+    if (days < daysInYear) {
+      dayOfYear = days;
+      break;
+    }
+    days -= daysInYear;
+    year++;
+  }
+  
+  // Days in each month
+  unsigned long daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+    daysInMonth[1] = 29; // Leap year
+  }
+  
+  // Calculate month and day
+  unsigned long month = 0;
+  unsigned long day = dayOfYear;
+  for (int i = 0; i < 12; i++) {
+    if (day < daysInMonth[i]) {
+      month = i + 1;
+      day += 1;
+      break;
+    }
+    day -= daysInMonth[i];
+  }
+  
+  // Format as yyyy-mm-dd
+  String date = String(year);
+  date += "-";
+  if (month < 10) date += "0";
+  date += String(month);
+  date += "-";
+  if (day < 10) date += "0";
+  date += String(day);
+  
+  return date;
+}
+
 void logger(String message){
   unsigned int fsize = f.size();
   if (fsize > 5000) {
@@ -96,6 +143,9 @@ void logger(String message){
     f.println("Log cleared");
   }
 
+  unsigned long epoch = timeClient.getEpochTime();
+  f.print(getFormattedDate(epoch));
+  f.print(" ");
   f.print(timeClient.getFormattedTime());
   f.print(" : ");
   f.print(message);
